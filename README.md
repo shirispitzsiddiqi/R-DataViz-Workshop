@@ -5,4 +5,4 @@ Brandt, M. J., Turner-Zwinkels, F. M., & Kubin, E. (2021). Political Psychology 
 
 The dataset is available to download at this [OSF respository](https://osf.io/3pwvb/).
 
-To prepare the data for the workshop, I processed the yllanon.csv file through the script DatasetCleaning.R. The output of that script is the file brandt_clean.csv.
+To prepare the data for the workshop, I processed the yllanon.csv file through the script DatasetCleaning.R. The output of that script is the file [brandt_clean.csv](https://github.com/shirispitzsiddiqi/R-DataViz-Workshop/blob/825d49751dae84f9cc9b6ae22fcaea9da7453fd6/brandt_clean.csv).
