@@ -1,5 +1,5 @@
 # R-DataViz-Workshop
-I delivered this workshop to my department at UC Irvine on December 4th, 2023. The workshop made use of a longitudinal open dataset collected by Mark Brandt, Felicity M. Turner-Zwinkels, and Emily Kubin published in their paper:
+I (Shiri Spitz Siddiqi) delivered this workshop to my department at UC Irvine on December 4th, 2023. The workshop made use of a longitudinal open dataset collected by Mark Brandt, Felicity M. Turner-Zwinkels, and Emily Kubin published in their paper:
 
 Brandt, M. J., Turner-Zwinkels, F. M., & Kubin, E. (2021). Political Psychology Data from a 26-wave Yearlong Longitudinal Study (2019–2020). _Journal of Open Psychology Data, 9_(1), 2. DOI: https://doi.org/10.5334/jopd.54 
 
