@@ -1,0 +1,437 @@
+---
+title: "DataViz"
+author: "Shiri Spitz Siddiqi"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    theme: lumen
+    toc_float: true
+    number_sections: yes
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=F)
+rm(list=ls())
+gc()
+```
+
+# Load libraries
+
+To do almost anything in R you need to load some specialized packages. These are some of the ones I always load.
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(interactions)
+library(rstatix)
+library(emmeans)
+library(easystats)
+library(ggtext)
+library(jtools)
+library(lubridate)
+#library(patchwork)
+#library(lmerTest)
+
+options(scipen=999) # turn off scientific notation
+
+# Custom mean-centering function that makes it easier to handle missing data
+mean_center <- function(data){
+  scale(data, center=mean(data, na.rm=T), scale=F) %>% 
+    as.vector()
+}
+```
+
+# Reading in and formatting data
+```{r}
+df <- read.csv(file="data/brandt_clean.csv", header=T) %>% 
+  type_convert()
+```
+
+Let's first understand the structure of this dataframe. Here are the names of all the variables (some of which I created for the purposes of this workshop) - notice we have one called `id_num` and another called `wave`.
+```{r}
+names(df)
+```
+
+Researchers surveyed participants every two weeks for a year, resulting in 26 waves of longitudinal data. Each row in the dataframe represents a participant's response at a single timepoint. 552 participants completed the survey at wave 1, with varying levels of attrition through the rest of the study period. 
+```{r}
+# Count how many participants responded at each wave
+df %>% count(wave) %>% ungroup()
+
+# Count how many waves each participant responded to (showing just the first 6 participants)
+df %>% count(id_num) %>% ungroup() %>% head()
+```
+
+Convert some important categorical variables to be of type "factor" so R plays nice with them.
+```{r}
+# Participant ID
+df$id_factor <- as.factor(df$id_num)
+
+# Wave
+df$wave_factor <- as.factor(df$wave)
+
+# Gender (only measured at wave 1; the column will be NA in other waves)
+df$gender <- factor(df$gender, levels=c(2,1), labels=c("Male", "Female"))
+
+# Racial minority status (only measured in wave 1; the column will be NA in other waves)
+# 3 was the code for "White" - if 3 appears in the response to the ethnicity question, assign
+# a 0; if it doesn't, assign a 1. 1 indicates the participant is a racial/ethnic minority.
+df <- df %>% mutate(eth_minor = case_when(is.na(ethnic) ~ NA,
+                                          !is.na(ethnic) & grepl("3", as.character(ethnic)) ~ 0,
+                                          T ~ 1))
+df$eth_minor <- factor(df$eth_minor, levels=c(0,1), labels=c("White", "POC"))
+
+# Participants' vote in 2016: 1 = Clinton, 2 = Trump, 3 = other
+# (Only measured at wave 1; the column will be NA in other waves)
+df$vote2016 <- factor(df$voting, levels=c(1,2,3), labels=c("Clinton Voters", "Trump Voters", "Others"))
+```
+
+Ways you can check that creation of a new variable was successful:
+```{r}
+class(df$vote2016)
+levels(df$vote2016) 
+table(df$wave, df$vote2016, useNA="ifany") %>% head()
+contrasts(df$vote2016) 
+```
+
+Let's say we want to change the contrasts on our `vote2016` variable to sum coding rather than treatment (dummy) coding:
+```{r}
+contrasts(df$vote2016) <- contr.sum(3)
+
+# With sum coding, R codes the last level of the factor as -1 in all vectors, 
+# so keep this in mind when initially creating your factor variable
+contrasts(df$vote2016)
+```
+
+Time is a component in this data because there are several waves of data collection. Dates are their own data type in R:
+```{r}
+df$StartDate <- lubridate::as_datetime(df$StartDate)
+class(df$StartDate)
+```
+
+There's several continuous variables in the dataset that we might want to use in regressions later on. It's useful to know how to do an operation on a bunch of variables at once to avoid repeating lines of code. Here's how to mean-center many variables:
+```{r}
+# Create a vector of the column names you want to center
+vars_to_center <- c("values", "interest", "ideo", "edu", "ewry", "partyid", "age")
+
+# Center variables within each wave of data and add them to the end of the dataframe
+df <- df %>% 
+  group_by(wave_factor) %>% 
+  mutate(across(all_of(vars_to_center),
+                \(x) mean_center(x), # this line is what's called an "anonymous function"
+                .names="{.col}_c")) %>% # remember to ungroup after a grouped operation
+  ungroup()
+
+# Finally let's go ahead and reverse-code approval ratings for Donald Trump, because currently the scale is 1 = Strongly approve and 4 = Strongly disapprove
+df <- df %>%
+  mutate(djt_app = 5-djt)
+```
+
+Some demographic variables were measured only once at baseline, so for convenience let's create a separate dataframe to hold them. We can merge them with data from other waves later based on the participant ID column.
+```{r}
+# Might be handy to have a dataframe holding all baseline data
+df_w1 <- df %>% filter(wave==1)
+
+# Grab the variables that were only measured at baseline
+demog <- df_w1 %>% 
+  select(id_factor, gender, ethnic, eth_minor, ideo, ideo_c, edu, edu_c, 
+         inc, age, age_c, state, relig, vote2016)
+```
+
+
+# Data wrangling
+
+First let's work with just the first wave of data.
+
+Respondents in this survey were asked to rate their opinions on a bunch of policy issues. Wouldn't it be cool to visualize the overall levels and distributions of participants' attitudes all in one graphic? To do that efficiently with our code, we need to pivot the dataframe from a format where each participant has one row with ratings for each policy in a separate column (wide format) to a format where each participant has 1 row for each policy rating (long format).
+
+Below is the easiest and most reliable method I have found for customizing the labeling of categorical variables on graphs. It saves you the trouble of having to bother with labeling functions when plotting or making tables, which can be very annoying at that stage.
+```{r}
+# pivot_longer lets you reshape your df_w1 from wide to long
+df_w1_long <- df_w1 %>% 
+  pivot_longer(cols=c(def, crime, terror, poor, health, econ, unemploy, blkaid, imm), 
+               names_to="policy", values_to="rating")
+
+# Alter the underlying data to set the labels for each policy within the dataframe itself
+df_w1_long$policy <- factor(df_w1_long$policy, 
+                         levels=c("crime", "def", "terror", "poor", "health", 
+                                  "econ", "unemploy", "blkaid", "imm"),
+                         labels=c("Crime", "Defense", "Terror", "Poor Aid", "Healthcare", 
+                                  "Econonmy", "Unemployment", "Black American Aid", "Immigration"),
+                         ordered=F)
+
+# Check to see that it worked by viewing the first few rows of the key columns
+df_w1_long %>% 
+  select(id_factor, policy, rating) %>% 
+  head(20)
+```
+Notice that the way the factor levels display is with the labels we gave them (e.g. "Defense"), not the values they actually have in the dataframe (e.g. "def").
+
+Some quick descriptive statistics:
+```{r}
+# Summary statistics
+df_w1_long %>% 
+  group_by(policy) %>% 
+  rstatix::get_summary_stats(rating) %>% 
+  ungroup()
+
+# Number of missing values on each policy rating
+df_w1_long %>% 
+  group_by(policy) %>% 
+  summarize(missing = sum(is.na(rating))) %>% 
+  ungroup()
+```
+
+# Descriptive visualization
+
+This part is the most fun! R has a package called `ggplot2` that is extremely powerful and flexible for visualizing data. ggplot objects work like a layer cake. You can add on layers of data, annotations, and other customizations related to the axes/general look of the plot. Layers added later appear on top of earlier layers, meaning that your "order of operations" matters and you can use it strategically to make certain information appear more prominent.
+
+Every ggplot visualization begins with a call to the `ggplot` function. Within that function, we generally call the `aes` function and specify the variables we want to use our visualization. For example, we may want to show the different policies along the X axis, have the mean rating for each policy on the Y axis, and maybe we want different colored bars to represent different voter groups. Let's work incrementally toward that visualization.
+
+First let's make a basic bar plot showing the average ratings for each policy - not split up by voter group yet. For plotting most summary statistics I like to use the `stat_summary` function. Make sure to include `na.rm=T` to drop missing values, because some functions don't work if they encounter missing data.
+```{r}
+df_w1_long %>% 
+  ggplot(aes(x=policy, y=rating)) + 
+  stat_summary(geom="col", fun.data="mean_se", na.rm=T) 
+```
+
+This is a good start but it could look a lot better.
+
+Let's make the same plot but use the `reorder` function to have the X-axis sorted according to the average rating for each policy. Let's also add error bars. Normally `stat_summary` will give us standard errors, but multiplying the length by 1.96 we can get confidence intervals around the sample mean (because 95% of the distribution of sample means falls within 1.96 standard errors of the mean).
+```{r}
+df_w1_long %>% 
+  ggplot(aes(x=reorder(policy, -rating, na.rm=T), y=rating)) +
+  stat_summary(geom="col", fun.data="mean_se", na.rm=T) +
+  stat_summary(geom="errorbar", fun.data="mean_se", fun.args=1.96, na.rm=T)
+```
+
+Now let's make it prettier by changing the look of the columns/error bars, applying a theme, and customizing the X- and Y-axis. The `alpha` argument controls transparency, `color` controls shape outline colors, and `fill` controls the shading inside shapes.
+```{r}
+df_w1_long %>% 
+  ggplot(aes(x=reorder(str_wrap(policy, 15), -rating, na.rm=T), y=rating)) +
+  stat_summary(geom="col", fun.data="mean_se", na.rm=T, alpha=.5, color="gray30", fill="seagreen") +
+  stat_summary(geom="errorbar", fun.data="mean_se", fun.args=1.96, na.rm=T, width=.5) +
+  theme_classic() +
+  scale_y_continuous(breaks=seq(1,7,1)) +
+  coord_cartesian(ylim=c(1,7)) +
+  labs(x="Policy", y="Rating") +
+  theme(axis.text.x = element_text(angle=20, hjust=1),
+        text = element_text(size=15))
+```
+
+This would be more informative if it were broken down by voter group, but tripling the number of bars would make things too crowded. Let's change our approach by taking advantage of R's faceting feature, which splits data across a number of panels. Each policy will get its own panel, and voter groups will be along the x-axis.
+
+Here is the most basic version of this figure:
+```{r}
+df_w1_long %>% 
+  ggplot(aes(x=vote2016, y=rating)) +
+  facet_wrap(~policy) +
+  stat_summary(geom="col", fun.data="mean_se", na.rm=T)
+```
+
+Here is a fancier version:
+```{r}
+p1 <- df_w1_long %>% 
+  ggplot(aes(x=vote2016, y=rating, fill=vote2016, color=vote2016)) +
+  facet_wrap(~reorder(policy, -rating, na.rm=T), nrow=3) +
+  geom_point(position=position_jitter(width=.3), na.rm=T, alpha=.3, size=.5) +
+  stat_summary(geom="col", fun.data="mean_se", na.rm=T, alpha=.4, 
+               position=position_dodge(width=1.75), color="gray30") +
+  stat_summary(geom="errorbar", fun.data="mean_se", fun.args=1.96,
+               na.rm=T, width=.3, position=position_dodge(), color="gray30") +
+  theme_classic() +
+  scale_y_continuous(breaks=seq(1,7,1)) +
+  coord_cartesian(ylim=c(1,7)) +
+  scale_fill_discrete(type=c("#648FFF", "#FE6100", "#FFB000")) +
+  scale_color_discrete(type=c("#648FFF", "#FE6100", "#FFB000")) +
+  labs(x="",
+       y="Support",
+       color="Voter group",
+       fill="Voter group",
+       title="Support for increased government spending among American voter groups",
+       caption="*n* = 552") + # italicize "n"
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        legend.position = "bottom", 
+        legend.box.spacing = margin(t=-10, unit="pt"),
+        text=element_text(size=13),
+        plot.caption=element_markdown()) 
+
+p1
+```
+
+-   See [here](https://derekogle.com/NCGraphing/resources/colors) for a visual palette of all color names that R recognizes
+
+-   David Nichols' [tool](https://davidmathlogic.com/colorblind/#%23D81B60-%231E88E5-%23FFC107-%23004D40) for creating colorblind-friendly palettes. The colors are specified as 6-digit HEX codes, which R recognizes as well.
+
+Let's try another way of visualizing the same data:
+```{r}
+df_w1_long %>% 
+  ggplot(aes(x=reorder(str_wrap(policy,15), -rating, na.rm=T), y=rating, group=vote2016, color=vote2016, shape=vote2016)) +
+  stat_summary(geom="line", fun.data="mean_se", na.rm=T, linewidth=2, alpha=.5) +
+  stat_summary(geom="errorbar", fun.data="mean_se", na.rm=T, width=.15, fun.args=1.96, linewidth=1, alpha=.7) +
+  scale_color_discrete(type=c("#648FFF", "#FE6100", "#FFB000")) +
+  theme_classic() +
+  scale_y_continuous(breaks=seq(1,7,1)) +
+  coord_cartesian(ylim=c(1,7)) +
+  labs(x="",
+       y="Support",
+       color="Voter group",
+       shape="Voter group",
+       title=str_wrap("Support for increased government spending among American voter groups",50),
+       caption="*n* = 552") + # italicize "n"
+  theme(axis.text.x = element_text(angle=30, hjust=1),
+        text = element_text(size=15),
+        plot.caption=element_markdown(),
+        legend.position="bottom",
+        legend.box.spacing = margin(t=-10, unit="pt"))
+```
+
+We might want to visualize things that are happening over time. Dates are a special data type that require their own functions.
+
+This dataset contains 26 waves of data spanning one year, which happened to coincide with the onset of COVID-19 around wave 23. One measure that was collected at every wave is feelings of tension, so let's see how feelings of tension may have changed over time. 
+
+Let's say we want to visualize this broken down by voter group - but we have a problem because the voting variable is missing for all waves after 1. We can use the `demog` dataframe we made earlier to copy over participants' demographic data across all the waves using what's called a joining function.
+```{r}
+tense <- df %>% 
+  select(id_factor, StartDate, wave_factor, tense) %>% 
+  left_join(demog, by="id_factor")
+
+# Don't try to use stat_summary functions when your X axis is continuous- it only works on discrete X axes
+# geom_smooth does work
+tense %>% 
+  ggplot(aes(x=StartDate, y=tense, color=vote2016, fill=vote2016)) +
+  #geom_point(position=position_jitter(height=.5), na.rm=T, alpha=.1) +
+  geom_smooth(method="loess", na.rm=T) +
+  theme_classic() +
+  scale_x_datetime(breaks="month", date_labels="%b\n%Y") +
+  scale_y_continuous(breaks=seq(1,7,1)) +
+  coord_cartesian(ylim=c(1,7)) +
+  scale_fill_discrete(type=c("#648FFF", "#FE6100", "#FFB000")) +
+  scale_color_discrete(type=c("#648FFF", "#FE6100", "#FFB000")) +
+  labs(y="\"I feel tense\"",
+       x="Date",
+       color="Voter group",
+       fill="Voter group") +
+  theme(legend.position="bottom")
+
+# wave_factor is discrete, unlike StartDate, so we can use stat_summary functions to get summary stats at each timepoint
+tense %>% 
+  ggplot(aes(x=wave_factor, y=tense, color=vote2016, fill=vote2016, linetype=vote2016, group=vote2016)) +
+  stat_summary(geom="point", fun.data="mean_se", na.rm=T, alpha=.8) +
+  stat_summary(geom="line", fun.data="mean_se", na.rm=T, alpha=.5, linewidth=.7) +
+  scale_color_discrete(type=c("#648FFF", "#FE6100", "#FFB000")) +
+  scale_y_continuous(breaks=seq(1,7,1)) +
+  theme_classic() +
+  coord_cartesian(ylim=c(1,7)) +
+  theme(legend.position="bottom") +
+  labs(y="\"I feel tense\"",
+       x="Date",
+       color="Voter group",
+       fill="Voter group",
+       linetype="Voter group") 
+```
+
+It looks like feelings of tension differed by ideology even way before COVID. Let's make a scatterplot showing the relationship between political ideology and feelings of tension:
+```{r}
+df_w1 %>% 
+  ggplot(aes(x=ideo, y=tense)) +
+  geom_point(position="jitter", alpha=.5, na.rm=T) + 
+  geom_smooth(method="lm", na.rm=T, fill="seagreen", color="seagreen") +
+  labs(x="Political ideology", y="\"I feel tense\"",
+       title=str_wrap("Feelings of tension as a function of political ideology at baseline",50)) +
+  theme_classic() +
+  scale_x_continuous(breaks=seq(1,7,1), labels=c("1\nVery\nliberal","2","3","4","5","6","7\nVery\nconservative")) +
+  scale_y_continuous(breaks=seq(1,7,1)) +
+  theme(text=element_text(size=13))
+```
+Notice how we can specify things like "fill" and "color" either within a call to `aes` or outside of it. It just depends on whether we want those things to distinguish different levels of a variable or not. Above we used color and fill to distinguish different voter groups, so we set them as aesthetics inside the `aes` function, but we don't need that here.
+
+Here we've also used the "labels" argument within the `scale_x_continuous` function to add some descriptive anchors to our X axis.
+
+# Regression analysis
+
+It's also possible to visualize the results of statistical models. Let's model Donald Trump's baseline approval ratings as a function of ideology, racial minority status, and gender.
+
+```{r, eval=F}
+djt %>% 
+  filter(!is.na(eth_minor)) %>% 
+  ggplot(aes(x=vote2016, y=djt_app, color=eth_minor, group=eth_minor)) +
+  stat_summary(geom="point", position=position_dodge(width=.5), fun.data="mean_se", na.rm=T) +
+  stat_summary(geom="point", position=position_dodge(width=.5), fun.data="mean_se", na.rm=T) +
+  theme_classic() +
+  coord_cartesian(ylim=c(1,4)) +
+  labs(color="Racial minority status",
+       y="Approval of Donald Trump") +
+  theme(legend.position="bottom") +
+  scale_color_discrete(type=c("palevioletred", "cyan4"))
+```
+
+
+```{r}
+djt <- df %>% 
+  filter(wave_factor=="1") %>% 
+  select(id_factor, djt_app) %>% 
+  left_join(demog, by="id_factor")
+
+fit0 <- lm(djt_app ~ ideo_c*eth_minor*gender, data=djt)
+summ(fit0)
+
+# 2-way interaction between gender x racial minority status
+fit0 %>% cat_plot(pred="gender", modx="eth_minor",
+                  interval=T, plot.points=T, jitter=.5, point.alpha=.2,
+                  dodge.width=0, errorbar.width=.2, x.label="Gender",
+                  legend.main="Minority status", y.label="Approval of Donald Trump",
+                  main.title="Approval of Donald Trump by gender and racial minority status")
+
+fit0 %>% estimate_means(at=c("gender", "eth_minor"))
+
+# 3-way interaction between ideology x gender x racial minority status
+fit0 %>% interact_plot(pred="ideo_c", modx="eth_minor", mod2="gender",
+                       interval=T, plot.points=T, jitter=.5, point.alpha=.2,
+                       partial.residuals=F, legend.main="Minority status",
+                       mod2.labels = c("Men", "Women"),
+                       x.label="Participant conservatism",
+                       y.label="Approval of Donald Trump",
+                       main.title=str_wrap("Approval of Donald Trump by ideology, gender, and racial minority status",50)) +
+  scale_x_continuous(breaks=seq(-2,4,1))
+
+fit0 %>% estimate_slopes(trend="ideo_c", at=c("gender", "eth_minor"))
+```
+
+I really like the `interact_plot` function BUT it gives you simple effects, not marginal effects. See what happens when we omit gender from the last plot:
+```{r}
+fit0 %>% interact_plot(pred="ideo_c", modx="eth_minor", interval=T) +
+  coord_cartesian(ylim=c(0.5,4.5)) +
+  theme(legend.position="bottom")
+```
+
+For any variables involved in the interaction that are not being plotted, the function chooses one level to plot at (aka, giving simple effects) - it does NOT average over the levels of that variable (aka, marginal effects). So I only use `interact_plot` when I want my plot to include all the variables in my interaction.
+
+The `emmeans` package does give you a way of averaging over levels of variables you're not plotting but I find it less user-friendly.
+```{r}
+# 3-way interaction
+fit0 %>% emmip(eth_minor~ideo_c|gender, cov.reduce=F, CI=T) +
+  coord_cartesian(ylim=c(0.5,4.5)) +
+  theme_nice() +
+  theme(legend.position="bottom")
+
+# 2-way interaction omitting gender
+fit0 %>% emmip(eth_minor~ideo_c, cov.reduce=F, CI=T) +
+  coord_cartesian(ylim=c(0.5,4.5)) +
+  theme_nice() +
+  theme(legend.position="bottom")
+```
+
+See how the 2-way interaction plot generated by `emmip` looks like an average of the plots for men and women.
+
+# Saving out visualizations
+
+I like to save out figures by running the code so it shows up in the Viewer pane, then I use `ggsave`, which saves the last shown figure to a path of your choosing. In an RMarkdown file, that means copy-pasting the code into the console. In a regular R script, you would just run the code and it shows in the Viewer pane.
+
+Earlier we saved a figure to a variable called `p1`. We can just type "p1" into the console, and it should show up in the Viewer pane. The dimensions of the image are determined by the size of the Viewer pane, so I adjust the size of the Viewer pane until the proportions seem good, and then I run `ggsave` like this:
+```{r}
+# Type "p1" in the console and hit enter. A figure should show up in the Viewer pane.
+ggsave("figures/policyratings.png")
+```
+
